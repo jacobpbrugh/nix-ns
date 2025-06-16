@@ -4,15 +4,8 @@ use nix::unistd::Uid;
 use std::env;
 use std::path::Path;
 
-mod lib;
-use lib::*;
+use nix_ns::*;
 
-// Implement conversion from our library error to anyhow::Error
-impl From<lib::NixNamespaceError> for anyhow::Error {
-    fn from(err: lib::NixNamespaceError) -> Self {
-        anyhow::anyhow!("{}", err)
-    }
-}
 
 #[derive(Parser)]
 #[command(
@@ -34,7 +27,9 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.debug {
-        env::set_var("RUST_BACKTRACE", "1");
+        unsafe {
+            env::set_var("RUST_BACKTRACE", "1");
+        }
     }
 
     // 1. Ensure running as root via sudo

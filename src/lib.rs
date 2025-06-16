@@ -5,10 +5,9 @@ use nix::mount::{mount, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::unistd::{self, AccessFlags, Gid, Uid, User};
 use std::env;
-use std::ffi::{CString, OsStr};
+use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -100,7 +99,7 @@ fn verify_sudo_user_internal(user_name: &str, uid: u32, gid: u32) -> AnyhowResul
     let gid = Gid::from_raw(gid);
 
     let user_by_uid = User::from_uid(uid)
-        .map_err(|e| anyhow!(e))?
+        .map_err(|e| anyhow!("Failed to lookup user by UID: {}", e))?
         .ok_or_else(|| anyhow!("No user found with UID {} in system records", uid))?;
 
     // Verify username matches what sudo provided
@@ -116,7 +115,7 @@ fn verify_sudo_user_internal(user_name: &str, uid: u32, gid: u32) -> AnyhowResul
 
     // Also lookup by name as additional verification
     let user_by_name = User::from_name(user_name)
-        .map_err(|e| anyhow!(e))?
+        .map_err(|e| anyhow!("Failed to lookup user by name: {}", e))?
         .ok_or_else(|| anyhow!("User '{}' not found in system records", user_name))?;
 
     // Ensure both lookups agree
@@ -387,7 +386,9 @@ pub fn clean_sudo_environment() -> Result<()> {
     ];
 
     for var in &sudo_vars {
-        env::remove_var(var);
+        unsafe {
+            env::remove_var(var);
+        }
     }
 
     Ok(())
@@ -438,10 +439,11 @@ fn execute_user_shell_internal(user: &SudoUser) -> AnyhowResult<()> {
     // Execute runuser, which will drop privileges and exec the shell
     // This replaces our process, so it should never return on success
     let prog = &args[0];
-    unistd::execvp(prog, &args)
-        .map_err(|e| anyhow!(e))
-        .context(
+    match unistd::execvp(prog, &args) {
+        Ok(_) => unreachable!("execvp should not return on success"),
+        Err(e) => Err(anyhow!(e)).context(
             "execvp failed to execute runuser. \
              This should not happen if runuser exists and is executable."
-        )
+        ),
+    }
 }
