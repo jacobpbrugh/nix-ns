@@ -12,15 +12,23 @@ use nix_ns::*;
     name = "nix-mount-namespace",
     about = "Creates a private mount namespace and bind mounts user's Nix directory",
     long_about = "This tool creates a private mount namespace and bind mounts \
-                  ~/.local/share/nix to /nix for Nix usage on shared environments.\n\n\
-                  Requirements:\n\
-                  - Must be run with sudo, ensuring SUDO_UID, SUDO_GID, and SUDO_USER are set.\n\
-                  - ~/.local/share/nix directory must exist on NFS with correct permissions."
+                  a user's Nix store to /nix for Nix usage on shared environments.\n\n\
+                  Installation methods (in order of security preference):\n\
+                  1. Setuid root: chmod u+s /path/to/nix-mount-namespace (RECOMMENDED)\n\
+                  2. Traditional sudo: sudo /path/to/nix-mount-namespace\n\
+                  3. Capabilities: setcap cap_sys_admin+ep /path/to/nix-mount-namespace (NOT RECOMMENDED)\n\n\
+                  Note: CAP_SYS_ADMIN grants extensive privileges and is less secure than setuid with privilege dropping.\n\n\
+                  The Nix store location can be configured via ~/.config/nix-ns/config.toml"
 )]
 struct Args {
     /// Show debug information during execution
     #[arg(short, long)]
     debug: bool,
+    
+
+    /// Path to user's Nix store directory (overrides config)
+    #[arg(short, long)]
+    source: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -32,11 +40,27 @@ fn main() -> Result<()> {
         }
     }
 
-    // 1. Ensure running as root via sudo
+    // Check if we have root privileges
     let current_euid = Uid::effective();
     if !current_euid.is_root() {
-        anyhow::bail!("This program must be run as root (via sudo)");
+        anyhow::bail!("This program requires root privileges. Install with setuid/setcap or run with sudo.");
     }
+
+    // Detect mode of operation
+    let is_sudo = env::var("SUDO_UID").is_ok() && 
+                  env::var("SUDO_GID").is_ok() && 
+                  env::var("SUDO_USER").is_ok();
+
+    if is_sudo {
+        // Legacy sudo mode
+        run_legacy_sudo_mode(&args)
+    } else {
+        // Modern secure mode
+        run_secure_mode(&args)
+    }
+}
+
+fn run_legacy_sudo_mode(args: &Args) -> Result<()> {
 
     // Fetch and validate sudo environment variables
     let sudo_uid = env::var("SUDO_UID")
@@ -110,4 +134,14 @@ fn main() -> Result<()> {
             user_info.shell.display(),
             user_info.name
         ))
+}
+
+fn run_secure_mode(args: &Args) -> Result<()> {
+    if args.debug {
+        eprintln!("DEBUG: Running in secure mode (setuid/setcap)");
+    }
+
+    // Use the new secure entry point
+    create_nix_namespace_secure()
+        .context("Failed to create Nix namespace in secure mode")
 }

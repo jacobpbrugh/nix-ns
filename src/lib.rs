@@ -8,8 +8,10 @@ use std::env;
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+
+pub mod security;
+use security::{SecurityContext, get_nix_store_path, verify_nix_mount_point_secure};
 
 pub const NIX_MOUNT_DIR: &str = "/nix";
 pub const NIX_USER_DIR: &str = ".local/share/nix";
@@ -154,7 +156,7 @@ fn verify_sudo_user_internal(user_name: &str, uid: u32, gid: u32) -> AnyhowResul
 ///
 /// This prevents symlink attacks where /nix could point to unexpected locations.
 pub fn prepare_nix_mount_point() -> Result<()> {
-    prepare_nix_mount_point_internal()
+    verify_nix_mount_point_secure()
         .map_err(|e| {
             // Check if it's a security violation
             let error_string = format!("{:#}", e);
@@ -169,55 +171,6 @@ pub fn prepare_nix_mount_point() -> Result<()> {
         })
 }
 
-fn prepare_nix_mount_point_internal() -> AnyhowResult<()> {
-    let nix_path = Path::new(NIX_MOUNT_DIR);
-
-    match fs::symlink_metadata(nix_path) {
-        Ok(metadata) => {
-            // Path exists - verify it's a proper directory
-            if metadata.file_type().is_symlink() {
-                bail!(
-                    "Security violation: {} exists but is a symlink. \
-                     This could be a symlink attack. Remove the symlink and retry.",
-                    NIX_MOUNT_DIR
-                );
-            }
-
-            if !metadata.file_type().is_dir() {
-                bail!(
-                    "{} exists but is not a directory (file type: {:?})",
-                    NIX_MOUNT_DIR,
-                    metadata.file_type()
-                );
-            }
-
-            // Verify permissions are reasonable (world-readable but only root-writable)
-            let perms = metadata.permissions();
-            let mode = perms.mode() & 0o777;
-            if mode & 0o022 != 0 {
-                eprintln!(
-                    "Warning: {} has permissive write permissions (mode: {:o}). \
-                     Consider restricting to 0755.",
-                    NIX_MOUNT_DIR,
-                    mode
-                );
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Create /nix with secure permissions
-            fs::create_dir(nix_path)
-                .with_context(|| format!("Failed to create {} directory", NIX_MOUNT_DIR))?;
-
-            fs::set_permissions(nix_path, fs::Permissions::from_mode(0o755))
-                .with_context(|| format!("Failed to set permissions on {}", NIX_MOUNT_DIR))?;
-        }
-        Err(e) => {
-            return Err(e).with_context(|| format!("Error accessing {}", NIX_MOUNT_DIR))
-        }
-    }
-
-    Ok(())
-}
 
 /// Compute the path to the user's Nix directory
 pub fn get_user_nix_path(user: &SudoUser) -> Result<PathBuf> {
@@ -402,6 +355,25 @@ pub fn execute_user_shell(user: &SudoUser) -> Result<()> {
         .map_err(|e| NixNamespaceError::Environment(format!("{:#}", e)))
 }
 
+/// Main entry point for creating a Nix namespace with security context
+/// This is the preferred method for setuid/setcap installations
+pub fn create_nix_namespace_secure() -> Result<()> {
+    create_nix_namespace_secure_internal()
+        .map_err(|e| {
+            let error_string = format!("{:#}", e);
+            if error_string.contains("Security violation") {
+                NixNamespaceError::SecurityViolation(error_string)
+            } else if error_string.contains("Permission") {
+                NixNamespaceError::PermissionDenied {
+                    path: PathBuf::from("/nix"),
+                    suggestion: "Check setuid/setcap installation".to_string(),
+                }
+            } else {
+                NixNamespaceError::MountOperation(error_string)
+            }
+        })
+}
+
 fn execute_user_shell_internal(user: &SudoUser) -> AnyhowResult<()> {
     // First verify runuser is available
     let runuser_path = Path::new("/sbin/runuser");
@@ -446,4 +418,72 @@ fn execute_user_shell_internal(user: &SudoUser) -> AnyhowResult<()> {
              This should not happen if runuser exists and is executable."
         ),
     }
+}
+
+fn create_nix_namespace_secure_internal() -> AnyhowResult<()> {
+    // Initialize security context
+    let ctx = SecurityContext::init()
+        .context("Failed to initialize security context")?;
+
+    // Prepare /nix mount point (requires root)
+    prepare_nix_mount_point()
+        .context("Failed to prepare /nix mount point")?;
+
+    // Get and validate the user's Nix store path
+    let nix_store_path = get_nix_store_path(&ctx)
+        .context("Failed to determine Nix store path")?;
+
+    // Validate the directory with dropped privileges
+    ctx.with_dropped_privileges(|| {
+        // Check directory exists and is accessible
+        if !nix_store_path.exists() {
+            bail!("Nix store directory {} does not exist", nix_store_path.display());
+        }
+        
+        // Verify we can access it
+        if let Err(e) = unistd::access(&nix_store_path, AccessFlags::R_OK | AccessFlags::X_OK) {
+            bail!("Cannot access Nix store directory {}: {}", nix_store_path.display(), e);
+        }
+        
+        Ok(())
+    })?;
+
+    // Create private mount namespace (requires root)
+    enter_private_mount_namespace()
+        .context("Failed to create private mount namespace")?;
+
+    // Perform the bind mount (requires root)
+    bind_mount_nix(&nix_store_path, Path::new(NIX_MOUNT_DIR))
+        .context("Failed to bind mount Nix store")?;
+
+
+    // CRITICAL: Drop root privileges immediately after mount operations
+    // This is the key security benefit of setuid over capabilities
+    ctx.drop_privileges()
+        .context("Failed to drop root privileges after mount operations")?;
+    // Clean environment if running under sudo
+    if ctx.is_sudo {
+        clean_sudo_environment()
+            .context("Failed to clean sudo environment")?;
+    }
+
+    // Execute the user's shell
+    if let Some(ref user) = ctx.user {
+        // For non-root users, use their shell
+        execute_user_shell(&SudoUser {
+            uid: user.uid,
+            gid: user.gid,
+            name: user.name.clone(),
+            home: PathBuf::from(&user.dir),
+            shell: PathBuf::from(&user.shell),
+        })?;
+    } else {
+        // Running as actual root - just exec a shell
+        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let shell_cstr = CString::new(shell.as_str())?;
+        let args = vec![shell_cstr.clone()];
+        unistd::execvp(&shell_cstr, &args)?;
+    }
+
+    Ok(())
 }

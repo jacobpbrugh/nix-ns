@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(grep:*)",
-      "Bash(cargo:*)"
+      "Bash(cargo:*)",
+      "Bash(sed:*)",
+      "Bash(./target/release/nix-mount-namespace --help)"
     ],
     "deny": []
   }

@@ -1,0 +1,11 @@
+# Example configuration file for nix-ns
+# Place this file at ~/.config/nix-ns/config.toml
+
+# Source path for your Nix store (relative to home directory)
+source_path = ".local/share/nix"
+
+# Whether to allow symlinks in the source path (default: false)
+# Setting this to true reduces security but may be needed in some environments
+allow_symlinks = false
+
+# Additional configuration options can be added here in the future

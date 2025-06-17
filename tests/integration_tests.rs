@@ -1,4 +1,4 @@
-use nix_mount_namespace::*;
+use nix_ns::*;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
@@ -72,10 +72,10 @@ mod environment_tests {
     #[test]
     fn test_sudo_environment_cleanup() {
         // Set up fake sudo environment
-        env::set_var("SUDO_UID", "1000");
-        env::set_var("SUDO_GID", "1000");
-        env::set_var("SUDO_USER", "testuser");
-        env::set_var("SUDO_COMMAND", "/usr/bin/test");
+        unsafe { env::set_var("SUDO_UID", "1000"); }
+        unsafe { env::set_var("SUDO_GID", "1000"); }
+        unsafe { env::set_var("SUDO_USER", "testuser"); }
+        unsafe { env::set_var("SUDO_COMMAND", "/usr/bin/test"); }
 
         // Clean should always succeed unless something catastrophic happens
         assert!(clean_sudo_environment().is_ok());
