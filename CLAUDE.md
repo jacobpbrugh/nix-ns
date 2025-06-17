@@ -93,8 +93,18 @@ Based on security research, this implementation prioritizes setuid over capabili
 Uses `unshare(CLONE_NEWNS)` to create a new mount namespace, allowing private `/nix` mounts without affecting the host system.
 
 ### Configuration
-The application can be configured via `~/.config/nix-ns/config.toml`:
-- `source_path`: Location of user's Nix store (default: `.local/share/nix`)
-- `allow_symlinks`: Whether to permit symlinks in the source path (default: false)
+The Nix store source path can be configured in multiple ways (in priority order):
+1. Command-line argument: `--source /path/to/nix/store`
+2. Environment variable: `NIX_NS_SOURCE=/path/to/nix/store`
+3. Configuration file: `~/.config/nix-ns/config.toml`
+4. Default: `~/.local/share/nix`
+
+Configuration file format:
+```toml
+# Source path for your Nix store (relative to home directory)
+source_path = ".local/share/nix"
+# Whether to allow symlinks in the source path (default: false)
+allow_symlinks = false
+```
 
 Configuration files must be owned by the user or root and not writable by group/others.

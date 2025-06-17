@@ -357,8 +357,8 @@ pub fn execute_user_shell(user: &SudoUser) -> Result<()> {
 
 /// Main entry point for creating a Nix namespace with security context
 /// This is the preferred method for setuid/setcap installations
-pub fn create_nix_namespace_secure() -> Result<()> {
-    create_nix_namespace_secure_internal()
+pub fn create_nix_namespace_secure(source_override: Option<String>) -> Result<()> {
+    create_nix_namespace_secure_internal(source_override)
         .map_err(|e| {
             let error_string = format!("{:#}", e);
             if error_string.contains("Security violation") {
@@ -420,9 +420,9 @@ fn execute_user_shell_internal(user: &SudoUser) -> AnyhowResult<()> {
     }
 }
 
-fn create_nix_namespace_secure_internal() -> AnyhowResult<()> {
+fn create_nix_namespace_secure_internal(source_override: Option<String>) -> AnyhowResult<()> {
     // Initialize security context
-    let ctx = SecurityContext::init()
+    let ctx = SecurityContext::init(source_override)
         .context("Failed to initialize security context")?;
 
     // Prepare /nix mount point (requires root)

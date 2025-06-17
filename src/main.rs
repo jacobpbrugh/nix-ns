@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nix::unistd::Uid;
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use nix_ns::*;
 
@@ -93,8 +93,14 @@ fn run_legacy_sudo_mode(args: &Args) -> Result<()> {
         .context("Failed to prepare /nix mount point")?;
 
     // 5. Validate the user's Nix directory
-    let user_nix_path = get_user_nix_path(&user_info)
-        .context("Failed to determine user's Nix directory path")?;
+    let user_nix_path = if let Some(ref source) = args.source {
+        // Use command-line override
+        PathBuf::from(source)
+    } else {
+        // Use default path
+        get_user_nix_path(&user_info)
+            .context("Failed to determine user's Nix directory path")?
+    };
 
     validate_user_nix_directory(&user_nix_path, &user_info)
         .with_context(|| format!(
@@ -142,6 +148,6 @@ fn run_secure_mode(args: &Args) -> Result<()> {
     }
 
     // Use the new secure entry point
-    create_nix_namespace_secure()
+    create_nix_namespace_secure(args.source.clone())
         .context("Failed to create Nix namespace in secure mode")
 }

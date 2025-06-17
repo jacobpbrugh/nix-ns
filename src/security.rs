@@ -44,7 +44,7 @@ pub struct SecurityContext {
 
 impl SecurityContext {
     /// Initialize security context, detecting how we were invoked
-    pub fn init() -> Result<Self> {
+    pub fn init(source_override: Option<String>) -> Result<Self> {
         let real_uid = getuid();
         let real_gid = getgid();
         let effective_uid = geteuid();
@@ -96,6 +96,12 @@ impl SecurityContext {
             
             (user, config)
         };
+
+        // Apply command-line override if provided
+        let mut config = config;
+        if let Some(source) = source_override {
+            config.source_path = PathBuf::from(source);
+        }
 
         Ok(Self {
             real_uid,
