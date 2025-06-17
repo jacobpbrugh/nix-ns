@@ -9,6 +9,7 @@ use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use tracing::{debug, info, warn, error, instrument};
 
 pub mod security;
 use security::{SecurityContext, get_nix_store_path, verify_nix_mount_point_secure};
@@ -68,6 +69,28 @@ impl Error for NixNamespaceError {
     }
 }
 
+impl From<anyhow::Error> for NixNamespaceError {
+    fn from(err: anyhow::Error) -> Self {
+        let error_string = format!("{:#}", err);
+        
+        // Pattern match on error content to categorize appropriately
+        if error_string.contains("Security violation") {
+            Self::SecurityViolation(error_string)
+        } else if error_string.contains("Permission denied") || error_string.contains("Insufficient permissions") {
+            Self::PermissionDenied {
+                path: PathBuf::new(),
+                suggestion: "Check permissions and file ownership".into(),
+            }
+        } else if error_string.contains("Mount") || error_string.contains("bind") {
+            Self::MountOperation(error_string)
+        } else if error_string.contains("User") || error_string.contains("SUDO") {
+            Self::UserValidation(error_string)
+        } else {
+            Self::Environment(error_string)
+        }
+    }
+}
+
 // Convenience type alias for internal use
 type AnyhowResult<T> = anyhow::Result<T>;
 
@@ -96,61 +119,36 @@ pub fn verify_sudo_user(user_name: &str, uid: u32, gid: u32) -> Result<SudoUser>
 
 // Internal implementation using anyhow for rich error context
 fn verify_sudo_user_internal(user_name: &str, uid: u32, gid: u32) -> AnyhowResult<SudoUser> {
-    // First, lookup by UID to get the canonical user information
+    use anyhow::ensure;
+    
     let uid = Uid::from_raw(uid);
     let gid = Gid::from_raw(gid);
-
-    let user_by_uid = User::from_uid(uid)
-        .map_err(|e| anyhow!("Failed to lookup user by UID: {}", e))?
-        .ok_or_else(|| anyhow!("No user found with UID {} in system records", uid))?;
-
-    // Verify username matches what sudo provided
-    if user_by_uid.name != user_name {
-        bail!(
-            "Security check failed: SUDO_USER '{}' does not match the username '{}' \
-             for UID {} in /etc/passwd. This may indicate tampered environment variables.",
-            user_name,
-            user_by_uid.name,
-            uid
-        );
-    }
-
-    // Also lookup by name as additional verification
-    let user_by_name = User::from_name(user_name)
-        .map_err(|e| anyhow!("Failed to lookup user by name: {}", e))?
-        .ok_or_else(|| anyhow!("User '{}' not found in system records", user_name))?;
-
-    // Ensure both lookups agree
-    if user_by_uid.uid != user_by_name.uid {
-        bail!(
-            "Security check failed: User '{}' has inconsistent UIDs \
-             (by UID lookup: {}, by name lookup: {})",
-            user_name,
-            user_by_uid.uid,
-            user_by_name.uid
-        );
-    }
-
-    // Verify primary GID matches (fixing the C++ bug where sudoGidStr was parsed incorrectly)
-    if user_by_uid.gid != gid {
-        bail!(
-            "Security check failed: SUDO_GID {} does not match primary GID {} \
-             for user '{}' in /etc/passwd",
-            gid.as_raw(),
-            user_by_uid.gid.as_raw(),
-            user_name
-        );
-    }
-
+    
+    let user = User::from_uid(uid)
+        .context("Failed to lookup user by UID")?
+        .ok_or_else(|| anyhow!("No user found with UID {}", uid))?;
+    
+    // Verify consistency
+    ensure!(
+        user.name == user_name,
+        "Security check failed: SUDO_USER '{}' doesn't match UID {} (expected '{}')",
+        user_name, uid, user.name
+    );
+    
+    ensure!(
+        user.gid == gid,
+        "Security check failed: SUDO_GID {} doesn't match user's primary GID {}",
+        gid.as_raw(), user.gid.as_raw()
+    );
+    
     Ok(SudoUser {
         uid,
         gid,
-        name: user_by_uid.name,
-        home: PathBuf::from(user_by_uid.dir),
-        shell: PathBuf::from(user_by_uid.shell),
+        name: user.name,
+        home: PathBuf::from(user.dir),
+        shell: PathBuf::from(user.shell),
     })
 }
-
 /// Ensure that /nix exists as a real directory (not a symlink).
 /// Creates it with appropriate permissions if it doesn't exist.
 ///
@@ -212,6 +210,7 @@ pub fn validate_user_nix_directory(path: &Path, user: &SudoUser) -> Result<()> {
 }
 
 fn validate_user_nix_directory_internal(path: &Path, user: &SudoUser) -> AnyhowResult<()> {
+    use anyhow::ensure;
     // Check existence and type using symlink_metadata to detect symlinks
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!(
@@ -220,17 +219,18 @@ fn validate_user_nix_directory_internal(path: &Path, user: &SudoUser) -> AnyhowR
             path.display()
         ))?;
 
-    if metadata.file_type().is_symlink() {
-        bail!(
-            "Security violation: '{}' is a symlink. The user Nix directory must be \
-             a real directory, not a symlink.",
-            path.display()
-        );
-    }
+    ensure!(
+        !metadata.file_type().is_symlink(),
+        "Security violation: '{}' is a symlink. The user Nix directory must be \
+         a real directory, not a symlink.",
+        path.display()
+    );
 
-    if !metadata.file_type().is_dir() {
-        bail!("'{}' exists but is not a directory", path.display());
-    }
+    ensure!(
+        metadata.file_type().is_dir(),
+        "'{}' exists but is not a directory", 
+        path.display()
+    );
 
     // Canonicalize paths to prevent directory traversal attacks
     let canonical_path = fs::canonicalize(path)
@@ -243,17 +243,16 @@ fn validate_user_nix_directory_internal(path: &Path, user: &SudoUser) -> AnyhowR
         ))?;
 
     // Ensure the Nix directory is actually within the user's home
-    if !canonical_path.starts_with(&canonical_home) {
-        bail!(
-            "Security violation: Directory '{}' (canonical: '{}') is not within \
-             the user's home directory '{}' (canonical: '{}'). \
-             This could indicate a symlink escape attempt.",
-            path.display(),
-            canonical_path.display(),
-            user.home.display(),
-            canonical_home.display()
-        );
-    }
+    ensure!(
+        canonical_path.starts_with(&canonical_home),
+        "Security violation: Directory '{}' (canonical: '{}') is not within \
+         the user's home directory '{}' (canonical: '{}'). \
+         This could indicate a symlink escape attempt.",
+        path.display(),
+        canonical_path.display(),
+        user.home.display(),
+        canonical_home.display()
+    );
 
     // Check that root can traverse the directory (X_OK)
     // This is crucial for NFS environments with root squashing
@@ -273,23 +272,36 @@ fn validate_user_nix_directory_internal(path: &Path, user: &SudoUser) -> AnyhowR
 ///
 /// This ensures our bind mount won't affect the host system and will
 /// be automatically cleaned up when the process exits.
+#[instrument]
 pub fn enter_private_mount_namespace() -> Result<()> {
+    info!("Creating new mount namespace");
+    
     // Create new mount namespace
     unshare(CloneFlags::CLONE_NEWNS)
-        .map_err(|e| NixNamespaceError::SystemCall {
-            call: "unshare(CLONE_NEWNS)".to_string(),
-            source: e,
+        .map_err(|e| {
+            error!("Failed to create mount namespace: {}", e);
+            NixNamespaceError::SystemCall {
+                call: "unshare(CLONE_NEWNS)".to_string(),
+                source: e,
+            }
         })?;
+    
+    debug!("Mount namespace created");
 
     // Make entire mount tree private to prevent propagation
     // Using explicit type parameters to help Rust's type inference
     let flags = MsFlags::MS_PRIVATE | MsFlags::MS_REC;
     mount::<str, str, str, str>(None, "/", None, flags, None)
-        .map_err(|e| NixNamespaceError::MountOperation(format!(
-            "Failed to make mount tree private with MS_PRIVATE|MS_REC: {}. \
-             This is required to prevent mount propagation to the host.",
-            e
-        )))?;
+        .map_err(|e| {
+            error!("Failed to make mount tree private: {}", e);
+            NixNamespaceError::MountOperation(format!(
+                "Failed to make mount tree private with MS_PRIVATE|MS_REC: {}. \
+                 This is required to prevent mount propagation to the host.",
+                e
+            ))
+        })?;
+    
+    debug!("Mount tree made private");
 
     Ok(())
 }
@@ -297,14 +309,20 @@ pub fn enter_private_mount_namespace() -> Result<()> {
 /// Bind mount the source directory to the target mount point.
 ///
 /// Uses MS_BIND without MS_REC as we're mounting a single directory.
+#[instrument(fields(source = %source.display(), target = %target.display()))]
 pub fn bind_mount_nix(source: &Path, target: &Path) -> Result<()> {
+    info!("Performing bind mount");
+    
     // Final verification that source exists
     if !source.exists() {
+        error!("Source directory does not exist: {}", source.display());
         return Err(NixNamespaceError::Filesystem {
             path: source.to_path_buf(),
             message: "Source directory does not exist".to_string(),
         });
     }
+    
+    debug!("Source directory verified: {}", source.display());
 
     // Perform the bind mount
     let flags = MsFlags::MS_BIND;
@@ -315,14 +333,19 @@ pub fn bind_mount_nix(source: &Path, target: &Path) -> Result<()> {
         flags,
         None::<&str>,  // No mount options needed
     )
-    .map_err(|e| NixNamespaceError::MountOperation(format!(
-        "Bind mount failed: {} -> {}. Error: {}. \
-         This could be due to insufficient permissions, \
-         missing source/target, or mount namespace restrictions.",
-        source.display(),
-        target.display(),
-        e
-    )))?;
+    .map_err(|e| {
+        error!("Bind mount failed: {} -> {}, error: {}", source.display(), target.display(), e);
+        NixNamespaceError::MountOperation(format!(
+            "Bind mount failed: {} -> {}. Error: {}. \
+             This could be due to insufficient permissions, \
+             missing source/target, or mount namespace restrictions.",
+            source.display(),
+            target.display(),
+            e
+        ))
+    })?;
+    
+    info!("Bind mount successful: {} -> {}", source.display(), target.display());
 
     Ok(())
 }
@@ -375,17 +398,18 @@ pub fn create_nix_namespace_secure(source_override: Option<String>) -> Result<()
 }
 
 fn execute_user_shell_internal(user: &SudoUser) -> AnyhowResult<()> {
+    use anyhow::ensure;
+    
     // First verify runuser is available
     let runuser_path = Path::new("/sbin/runuser");
     if !runuser_path.exists() {
         // Try alternative location
         let alt_path = Path::new("/usr/sbin/runuser");
-        if !alt_path.exists() {
-            bail!(
-                "runuser binary not found in /sbin/runuser or /usr/sbin/runuser. \
-                 Please install util-linux package."
-            );
-        }
+        ensure!(
+            alt_path.exists(),
+            "runuser binary not found in /sbin/runuser or /usr/sbin/runuser. \
+             Please install util-linux package."
+        );
     }
 
     // Ensure we can execute it
@@ -421,6 +445,7 @@ fn execute_user_shell_internal(user: &SudoUser) -> AnyhowResult<()> {
 }
 
 fn create_nix_namespace_secure_internal(source_override: Option<String>) -> AnyhowResult<()> {
+    use anyhow::ensure;
     // Initialize security context
     let ctx = SecurityContext::init(source_override)
         .context("Failed to initialize security context")?;
@@ -436,9 +461,11 @@ fn create_nix_namespace_secure_internal(source_override: Option<String>) -> Anyh
     // Validate the directory with dropped privileges
     ctx.with_dropped_privileges(|| {
         // Check directory exists and is accessible
-        if !nix_store_path.exists() {
-            bail!("Nix store directory {} does not exist", nix_store_path.display());
-        }
+        ensure!(
+            nix_store_path.exists(), 
+            "Nix store directory {} does not exist", 
+            nix_store_path.display()
+        );
         
         // Verify we can access it
         if let Err(e) = unistd::access(&nix_store_path, AccessFlags::R_OK | AccessFlags::X_OK) {

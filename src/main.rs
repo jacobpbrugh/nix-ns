@@ -3,6 +3,8 @@ use clap::Parser;
 use nix::unistd::Uid;
 use std::env;
 use std::path::{Path, PathBuf};
+use tracing::{info, debug, error};
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 use nix_ns::*;
 
@@ -34,22 +36,44 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Initialize tracing/logging
+    let log_level = if args.debug { "debug" } else { "info" };
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("nix_ns={}", log_level)));
+    
+    let subscriber = FmtSubscriber::builder()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .finish();
+    
+    tracing::subscriber::set_global_default(subscriber)
+        .context("Failed to initialize logging")?;
+
     if args.debug {
         unsafe {
             env::set_var("RUST_BACKTRACE", "1");
         }
     }
+    
+    info!("nix-ns starting");
 
     // Check if we have root privileges
     let current_euid = Uid::effective();
     if !current_euid.is_root() {
+        error!("Insufficient privileges: effective UID is {}", current_euid);
         anyhow::bail!("This program requires root privileges. Install with setuid/setcap or run with sudo.");
     }
+
+    debug!("Root privileges confirmed: effective UID is {}", current_euid);
 
     // Detect mode of operation
     let is_sudo = env::var("SUDO_UID").is_ok() && 
                   env::var("SUDO_GID").is_ok() && 
                   env::var("SUDO_USER").is_ok();
+
+    info!("Operating mode: {}", if is_sudo { "legacy sudo" } else { "secure setuid/setcap" });
 
     if is_sudo {
         // Legacy sudo mode
