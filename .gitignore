@@ -1,0 +1,7 @@
+/target
+/.claude/settings.local.json
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

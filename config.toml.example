@@ -1,0 +1,8 @@
+# Example configuration file for nix-ns
+# Copy to ~/.config/nix-ns/config.toml
+
+# Source directory to mount to /nix (required)
+source = "/home/username/.local/share/nix-ns/store"
+
+# Shell to execute (optional, defaults to $SHELL or /bin/sh)
+shell = "/bin/bash"
